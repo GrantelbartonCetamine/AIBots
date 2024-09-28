@@ -1,0 +1,349 @@
+import os
+import torch as T
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import os
+import cv2
+from typing import TypeVar, Tuple , Dict
+import pyautogui
+
+class MainNetwork(nn.Module):
+
+    def __init__(self, model_path , checkpoint_path , n_actions , lr , input_dims):
+        super().__init__()
+
+        self.chekpoint_dir = checkpoint_path
+        self.file = os.path.join(self.chekpoint_dir , model_path)
+
+        self.conv1 = nn.Conv2d(input_dims[0] , 64 , 8 , 2 , 2)
+        self.conv2 = nn.Conv2d(64 , 64 , 8 , 2 , 2)
+        self.conv3 = nn.Conv2d(64 , 64 , 8 , 2 , 2)
+
+        self.activation = nn.PReLU()
+        self.optim = optim.Adam(self.parameters()  , lr = lr)
+        self.loss = nn.MSELoss()
+        self.device = T.device("cuda" if T.cuda.is_available() else "cpu")
+        
+        comp = self.comp_in_dims(input_dims)
+
+        self.fc1 = nn.Linear(comp , 1024)
+        self.fc2 = nn.Linear(1024 , 512)
+        self.A = nn.Linear(512 , n_actions)
+        self.V = nn.Linear(512 , 1)
+
+    def forward(self , state):
+        
+        print(state)
+
+        X = self.activation(self.conv1(state))
+        X2 = self.activation(self.conv2(X))
+        X3 = self.activation(self.conv3(X2))
+
+        flatten = X3.view(X2.size()[0] , -1)
+
+        A = self.fc1(flatten)
+        V = self.fc2(A)
+
+        return V , A
+    
+    def comp_in_dims(self, input_dims):
+
+        dims = self.conv1(input_dims)
+        dims = self.conv2(dims)
+        dims = self.conv3(dims)
+
+        return int(np.prod(dims.shape[1:]))
+    
+    def saving_model(self):
+        print("... saving in progress ...")
+        T.save(self.state_dict() , self.chekpoint_dir)
+
+    def loading_mode_state_dict(self):
+        print("... loading in progress ... ")
+        self.load_state_dict(T.load(self.chekpoint_dir))
+
+class ReplayBuffer():
+
+    def __init__(self , max_buffer_size , lr , in_dims , n_actions):
+        self.max = max_buffer_size
+        self.mem_cntr = 0
+
+        self.state_memory = np.zeros((self.max, *in_dims) , dtype = np.float32)
+        self.update_state_memory =np.zeros((self.max, *in_dims) , dtype = np.float32)
+
+        self.action_memory = np.zeros((self.max,  *in_dims) ,dtype= np.float32)
+        self.reward_memory = np.zeros((self.max, *in_dims) , dtype = np.float32)
+        self.terminal_memory = np.zeros((self.max, *in_dims) , dtype = bool)
+
+    def sample_batches(self , state , update , n_actions , rewards , done):
+
+        X = self.mem_cntr % self.max 
+
+        self.state_memory[X] = state
+        self.update_state_memory[X] = update
+        self.action_memory[X] = n_actions
+        self.reward_memory[X] = rewards
+        self.terminal_memory[X] = done
+
+        self.mem_cntr += 1
+
+    def batch_memory(self , batch_size):
+
+        max_ = max(self.mem_cntr , self.max )
+        rnd = np.random.choice(max_ , batch_size , replace= False)
+
+        state = self.state_memory[rnd]
+        update =self.update_state_memory[rnd]
+        n_actions = self.action_memory[rnd]
+        rewards = self.reward_memory[rnd]
+        terminal = self.terminal_memory[rnd]
+
+        return state , update , n_actions , rewards , terminal
+    
+class Agent():
+
+    def __init__(self , lr , input_dims , n_actions ,  max_buffer_size , batch_size ,
+                 replace = 1000 , eps = 1.0 , eps_dec = 1e-3 , eps_min = 1e-2 , gamma = 0.99,
+                 model_path = None , chechpoint_path = None):
+        self.lr = lr
+        self.input_dims = input_dims
+        self.n_actions= n_actions
+        self.max_buffer_size = max_buffer_size
+        self.eps = eps
+        self.eps_dec = eps_dec
+        self.eps_min = eps_min
+        self.gamma = gamma 
+        self.model_path = model_path
+        self.chechpoint_path = chechpoint_path 
+        self.batch_size = batch_size
+        self.action_space = [i for i in range(self.n_actions)]
+        self.replace_target_network = replace
+        self.learn_rate_step_size = 0
+        
+        self.memory = ReplayBuffer(
+            in_dims= self.input_dims,
+            max_buffer_size= self.max_buffer_size,
+            lr = self.lr,
+            n_actions= self.n_actions)
+        
+        self.Main_Network = MainNetwork(
+            model_path= self.model_path,
+            checkpoint_path=self.chechpoint_path,
+            n_actions= self.n_actions,
+            lr=self.lr,
+            input_dims=self.input_dims)
+        
+        self.Target_Network = MainNetwork(
+            model_path= self.model_path,
+            checkpoint_path=self.chechpoint_path,
+            n_actions= self.n_actions,
+            lr=self.lr,
+            input_dims=self.input_dims)
+        
+    def choose_actions(self , observations):
+
+        if np.random.random() < self.eps:
+            np_arr = np.array([observations] , copy = False , dtype = np.float32)
+            arr_to_tensor = T.tensor(np_arr)
+            _, advantages = self.Main_Network.forward(arr_to_tensor)
+
+            actions = T.argmax(advantages).item()
+
+        else :
+                actions = np.random.choice(self.action_space)
+
+        return actions 
+    
+    def dec_eps(self):
+
+        self.eps = self.eps - self.eps_dec if self.eps < self.eps_min else self.eps_min
+
+    def replace_target_network_fun(self):
+
+        if self.Target_Network is not None and \
+        self.replace_target_network % self.learn_rate_step_size == 0:
+            self.Target_Network(self.Main_Network.load_state_dict())
+
+    def sample_obs_batches(self):
+
+        state , update , n_actions , rewards , done = self.memory.sample_batches(self.batch_size)
+
+        return state , update , n_actions , rewards , done
+    
+    def sample_Main_batches(self , state , update , n_actions , rewards , done):
+
+        self.memory.batch_memory(state , update , n_actions , rewards , done)
+
+        states = T.tensor(state).to(self.Main_Network.device)
+        updates = T.tensor(update).to(self.Main_Network.device)
+        n_action = T.tensor(n_actions).to(self.Main_Network.device)
+        reward = T.tensor(rewards).to(self.Main_Network.device)
+        terminal = T.tensor(done).to(self.Main_Network.device)
+
+        return states , updates , n_action , reward , terminal
+    
+    def learn(self):
+
+        if self.memory.mem_cntr < self.batch_size:
+            return
+        
+        self.Main_Network.zero_grad()
+        self.replace_target_network_fun()
+
+        state , update , n_actions , rewards , done = self.sample_Main_batches()
+        indices = np.arange(self.batch_size)
+
+        v_s , a_s = self.Main_Network.forward(state)
+        v_s_eval , a_s_eval = self.Main_Network.forward(update)
+        v_s , a_s = self.Target_Network.forward(state)
+
+        Q_V1 = T.add(v_s , (a_s - a_s.mean(dim = 1 ,keepdim = True)))[n_actions , indices]
+        MainNetwork = T.add(v_s_eval , (a_s_eval- a_s_eval.mean(dim = 1 ,keepdim = True)))
+        Target_Network = T.add(v_s , (a_s - a_s.mean(dim = 1 ,keepdim = True)))
+
+        max__ = T.argmax(MainNetwork , dim = 1)
+
+        q_target = rewards + self.gamma * self.Target_Network[max__]
+
+        loss = self.Main_Network.loss(q_target , Q_V1)
+        loss.backward()
+        self.Main_Network.optim.step()
+        self.dec_eps()
+
+class Actions():
+    WALK_FORWARD = 0
+    WALK_BACKWARD = 1
+    AIM = 2
+    SHOOT = 3
+    RELOAD = 4
+    TURN_AROUND_FAST = 5
+
+class ResidentEvilEnv:
+
+    ObsType = TypeVar("ObsType")
+    ActType = TypeVar("ActType")
+
+    def __init__(self):
+        self.actions = {
+            Actions.WALK_FORWARD: self.walking_forward,
+            Actions.WALK_BACKWARD: self.walking_backward,
+            Actions.AIM: self.aim,
+            Actions.SHOOT: self.shoot,
+            Actions.RELOAD : self.Reload,
+            Actions.TURN_AROUND_FAST : self.TURN_AROUND_FAST}
+        self.health = 100
+
+    def step(self, action: ActType) -> Tuple[ObsType, float, bool, Dict]:
+
+        if action in self.actions:
+            self.actions[action]()
+            observation = self.getObs()  
+
+            reward = self.calculate_reward() 
+
+            done = self.check_done()  
+            
+            return observation, reward, done, {}
+        else:
+            raise ValueError(f"Unbekannte Aktion: {action}")
+        
+    def check_done(self):
+        if self.health <= 0:
+            return True
+        return False
+
+    def calculate_reward(self) -> float:
+        reward = 0
+
+        reward += self.enemies_defeated 
+        
+        if self.health < 100:
+            reward -= (100 - self.health) 
+
+        return reward
+
+    def perform_action(self, action: Actions):
+
+        if action in self.actions:
+            self.actions[action]()
+        else:
+            print(f"Unbekannte Aktion: {action}")
+
+    def walking_forward(self):
+        print("Gehe vorwärts")
+        pyautogui.press('w') 
+
+    def walking_backward(self):
+        print("Gehe rückwärts")
+        pyautogui.press('s') 
+
+    def aim(self):
+        print("Zielen")
+        pyautogui.press('mouse1')  
+
+    def shoot(self):
+        print("Schießen")
+        pyautogui.press('mouse2') 
+
+    def Reload(self):
+        print("Reload")
+        self.aim()
+        pyautogui.press("r") 
+
+    def TURN_AROUND_FAST(self):
+        print("TURN_AROUND_FAST")
+        pyautogui.press("s") 
+        pyautogui.press("s") 
+
+    def getObs():
+        screenshot = pyautogui.screenshot()
+        img_array = np.array(screenshot)
+        img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)  
+        img_array = cv2.resize(img_array, (84, 84))  
+        img_array = img_array / 255.0  
+        return img_array
+    
+    def __len__(self):
+
+        return len(self.actions)
+
+if __name__ == "__main__":
+
+    env = ResidentEvilEnv()
+
+    agent = Agent(lr=1e-3,
+                  input_dims=(1 , 1 , 84 , 84),
+                  n_actions = env.__len__(),
+                  max_buffer_size= 10000,
+                  batch_size= 200,
+                  replace= 1000,
+                  eps= 1.0,
+                  eps_dec = 1e-3,
+                  gamma= 0.99,
+                  model_path= r"I:\Sonstiges\Programmieren\Machine Learning\Part 6 - Reinforcement Learning",
+                  chechpoint_path= r"I:\Sonstiges\Programmieren\Machine Learning\Part 6 - Reinforcement Learning")
+
+    rewards = []
+
+    game_iters = 1000
+
+    scores = []
+
+    for i in range(game_iters):
+
+        done = False
+
+        truncated = False
+
+        score = 0
+
+        obs = env.getObs()
+
+        while not done and not truncated :
+            actions = agent.choose_actions(obs)
+            env.perform_action(actions)
+            observation_, reward, done, info = env.step(actions)
+            agent.sample_obs_batches(observation_ , actions , reward)
+            observations = obs
+            agent.learn()
