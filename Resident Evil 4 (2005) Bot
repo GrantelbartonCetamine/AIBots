@@ -148,14 +148,14 @@ class Agent():
         
     def choose_actions(self, observations):
         if np.random.random() > self.eps:
-            np_arr = np.array([observations], dtype=np.float32)  # Directly cast to float32
+            np_arr = np.array([observations], dtype=np.float32)  
             arr_to_tensor = T.tensor(np_arr).to(self.Main_Network.device)
 
-            with T.no_grad():  # Disable gradient calculation
+            with T.no_grad(): 
                 V, advantages = self.Main_Network.forward(arr_to_tensor)
 
             Q_values = V + (advantages - advantages.mean(dim=1, keepdim=True))
-            actions = T.argmax(Q_values, dim=1).item()  # Get the action with max Q-value
+            actions = T.argmax(Q_values, dim=1).item() 
         else:
             actions = np.random.choice(self.action_space)
 
